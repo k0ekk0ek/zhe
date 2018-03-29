@@ -1,7 +1,11 @@
 #ifndef TRANSPORT_UDP_H
 #define TRANSPORT_UDP_H
 
+#if defined(LWIP_SOCKET)
+#include <lwip/sockets.h>
+#else
 #include <netinet/in.h>
+#endif /* LWIP_SOCKET */
 #include "zhe-platform.h"
 
 typedef struct zhe_address {
@@ -24,6 +28,17 @@ void zhe_platform_background(struct zhe_platform * const platform);
 
 #define PORT       0x1d17u   /* 7447 */
 #define MCADDR     0xefff0001u /* 239.255.0.1 */
+
+#if defined(__IAR_SYSTEMS_ICC__)
+#define __ORDER_BIG_ENDIAN__ 4321
+#define __ORDER_LITTLE_ENDIAN__ 1234
+#if __LITTLE_ENDIAN__
+#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__
+#else
+#define __BYTE_ORDER__ __ORDER_BIG_ENDIAN__
+#endif
+#endif
+
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define MCADDR_NBO MCADDR
 #define PORT_NBO   PORT
@@ -34,7 +49,7 @@ void zhe_platform_background(struct zhe_platform * const platform);
 #error "byte order must be known for IP address constants"
 #endif
 
-static const zhe_address_t scoutaddr = {
+static zhe_address_t scoutaddr = {
     .a = {
         .sin_family = AF_INET,
         .sin_port = PORT_NBO,

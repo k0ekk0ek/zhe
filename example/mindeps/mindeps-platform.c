@@ -5,17 +5,34 @@
 #include <inttypes.h>
 
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+
+#if defined(__IAR_SYSTEMS_ICC__)
+typedef long int ssize_t;
+#endif /* __IAR_SYSTEMS_ICC__ */
+
+#if defined(FREERTOS)
+#include <FreeRTOS.h>
+#include <task.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#endif /* FREERTOS */
+
+#if defined(LWIP_SOCKET)
+#include <lwip/inet.h>
+#include <lwip/netif.h>
+#include <lwip/sockets.h>
+#else
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#endif /* LWIP_SOCKET */
 
 #include "mindeps-platform.h"
 #include "zhe-tracing.h"
@@ -34,6 +51,21 @@ struct udp {
 };
 
 static struct udp gudp;
+
+
+#if defined(FREERTOS)
+zhe_time_t
+zhe_platform_time(void)
+{
+    /* configTICK_RATE_HZ is the number of ticks per second, while this is
+       normally 1000 (one tick per millisecond) and can be returned directly,
+       this function divides the number of ticks by the configTICK_RATE_HZ
+       divided by a thousand should it be different for some platform. */
+    TickType_t tcks = xTaskGetTickCount();
+
+    return (zhe_time_t)(tcks / (configTICK_RATE_HZ / 1000));
+}
+#else
 static struct timespec toffset;
 
 zhe_time_t zhe_platform_time(void)
@@ -42,7 +74,20 @@ zhe_time_t zhe_platform_time(void)
     (void)clock_gettime(CLOCK_MONOTONIC, &t);
     return (zhe_time_t)((t.tv_sec - toffset.tv_sec) * (1000000000 / ZHE_TIMEBASE) + t.tv_nsec / ZHE_TIMEBASE);
 }
+#endif /* FREERTOS */
 
+#if defined(FREERTOS)
+void zhe_platform_trace(struct zhe_platform *pf, const char *fmt, ...)
+{
+    uint32_t t = (uint32_t)zhe_platform_time();
+    va_list ap;
+    va_start(ap, fmt);
+    printf("%4"PRIu32".%03"PRIu32" ", ZTIME_TO_SECu32(t), ZTIME_TO_MSECu32(t));
+    (void)vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+}
+#else /* FREERTOS */
 void zhe_platform_trace(struct zhe_platform *pf, const char *fmt, ...)
 {
     uint32_t t = (uint32_t)zhe_platform_time();
@@ -55,6 +100,7 @@ void zhe_platform_trace(struct zhe_platform *pf, const char *fmt, ...)
     funlockfile(stdout);
     va_end(ap);
 }
+#endif /* FREERTOS */
 
 static void set_nonblock(int sock)
 {
@@ -63,24 +109,54 @@ static void set_nonblock(int sock)
     (void)fcntl(sock, F_SETFL, flags);
 }
 
-struct zhe_platform *zhe_platform_new(uint16_t port)
+#if defined(LWIP_SOCKET)
+static size_t
+fill_udp(
+    struct udp * const udp,
+    uint16_t port)
 {
-    const int one = 1;
-    struct udp * const udp = &gudp;
-    struct sockaddr_in addr;
-    socklen_t addrlen;
-    struct ifaddrs *ifa;
+    struct netif *netif;
 
-    (void)clock_gettime(CLOCK_MONOTONIC, &toffset);
-    toffset.tv_sec -= toffset.tv_sec % 10000;
-
+    (void)memset(udp, 0, sizeof(*udp));
     udp->port = htons(port);
 
-    /* Get own IP addresses so we know what to filter out -- disabling MC loopback would help if
-       we knew there was only a single proces on a node, but I actually want to run multiple for
-       testing. This does the trick as long as the addresses don't change. There are (probably)
-       various better ways to deal with the original problem as well. */
-    udp->nself = 0;
+    for (netif = netif_list; netif != NULL; netif = netif->next) {
+        if (IP_IS_V4(&(netif->ip_addr))) {
+            struct zhe_address za;
+            (void)memset(&za.a, 0, sizeof(za.a));
+            za.a.sin_family = AF_INET;
+            inet_addr_from_ip4addr(&za.a.sin_addr, &netif->ip_addr);
+            char str[TRANSPORT_ADDRSTRLEN];
+            zhe_platform_addr2string(NULL, str, sizeof(str), &za);
+            if (za.a.sin_addr.s_addr == htonl(INADDR_ANY) ||
+                za.a.sin_addr.s_addr == htonl(INADDR_NONE))
+            {
+                ZT(TRANSPORT, "%s%u: %s (not interesting)",
+                  netif->name, netif->num, str);
+            } else if (udp->nself < MAX_SELF) {
+                ZT(TRANSPORT, "%s%u: %s",
+                  netif->name, netif->num, str);
+                udp->self[udp->nself++] = za.a.sin_addr.s_addr;
+            } else {
+                ZT(TRANSPORT, "%s%u: %s (no space left)",
+                  netif->name, netif->num, str);
+            }
+        }
+    }
+
+    return udp->nself;
+}
+#else /* LWIP_SOCKET */
+static size_t
+fill_udp(
+    struct udp * const udp,
+    uint16_t port)
+{
+    struct ifaddrs *ifa;
+
+    (void)memset(udp, 0, sizeof(*udp));
+    udp->port = htons(port);
+
     if (getifaddrs(&ifa) == -1) {
         perror("getifaddrs");
         return NULL;
@@ -91,7 +167,9 @@ struct zhe_platform *zhe_platform_new(uint16_t port)
                 struct zhe_address za = { *a };
                 char str[TRANSPORT_ADDRSTRLEN];
                 zhe_platform_addr2string(NULL, str, sizeof(str), &za);
-                if (a->sin_addr.s_addr == htonl(INADDR_ANY) || a->sin_addr.s_addr == htonl(INADDR_NONE)) {
+                if (a->sin_addr.s_addr == htonl(INADDR_ANY) ||
+                    a->sin_addr.s_addr == htonl(INADDR_NONE))
+                {
                     ZT(TRANSPORT, "%s: %s (not interesting)", c->ifa_name, str);
                 } else if (udp->nself < MAX_SELF) {
                     ZT(TRANSPORT, "%s: %s", c->ifa_name, str);
@@ -104,6 +182,30 @@ struct zhe_platform *zhe_platform_new(uint16_t port)
         freeifaddrs(ifa);
     }
     if (udp->nself == 0) {
+        return NULL;
+    }
+
+    return udp->nself;
+}
+#endif /* LWIP_SOCKET */
+
+struct zhe_platform *zhe_platform_new(uint16_t port)
+{
+    const int one = 1;
+    struct udp * const udp = &gudp;
+    struct sockaddr_in addr;
+    socklen_t addrlen;
+
+#if !defined(FREERTOS) /* FIXME: Port to FreeRTOS */
+    (void)clock_gettime(CLOCK_MONOTONIC, &toffset);
+    toffset.tv_sec -= toffset.tv_sec % 10000;
+#endif /* FREERTOS */
+
+    /* Get own IP addresses so we know what to filter out -- disabling MC loopback would help if
+       we knew there was only a single proces on a node, but I actually want to run multiple for
+       testing. This does the trick as long as the addresses don't change. There are (probably)
+       various better ways to deal with the original problem as well. */
+    if (!fill_udp(udp, port)) {
         return NULL;
     }
 
@@ -134,6 +236,7 @@ struct zhe_platform *zhe_platform_new(uint16_t port)
 
     /* MC sockets needs reuse options set, and is bound to the MC address we use at a "well-known" 
        port number */
+#if !defined(LWIP_SOCKET)
     if (setsockopt(udp->s[1], SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one)) == -1) {
         perror("SO_REUSEADDR");
         goto err;
@@ -143,7 +246,8 @@ struct zhe_platform *zhe_platform_new(uint16_t port)
         perror("SO_REUSEPORT");
         goto err;
     }
-#endif
+#endif /* SO_REUSEPORT */
+#endif /* LWIP_SOCKET */
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = udp->port;
